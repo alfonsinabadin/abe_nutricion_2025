@@ -1,0 +1,17 @@
+a, .navbar, .btn-primary, .tocify .tocify-focus {
+  color: #ffffff !important;       /* texto blanco */
+    background-color: #8e44ad !important; /* nuevo color principal (violeta) */
+    border-color: #732d91 !important;
+}
+
+
+.tocify {
+  background-color: #A75F37 !important; /* color de fondo */
+  border: 1px solid #ddd !important;
+}
+
+
+/* Títulos */
+  h1, h2, h3, h4, h5, h6 {
+    color: #CA8E83;  /* ejemplo: gris oscuro */
+  }

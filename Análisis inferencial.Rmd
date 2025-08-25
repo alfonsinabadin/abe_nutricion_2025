@@ -1,0 +1,556 @@
+---
+title: "Análisis inferencial"
+output: 
+  html_document:
+    theme: flatly
+    toc: no
+css: Back/styles.css
+---
+
+Se realizará un análisis inferencial que buscará identificar asociaciones 
+estadísticas entre la calidad del sueño (variable dependiente) y las variables 
+de ingesta nutricional. Se utilizarán pruebas de hipótesis según el tipo y distribución de
+variables: prueba t de Student o Mann-Whitney para analizar asociaciones entre calidad de
+sueño y variables cuantitativas, y prueba chicuadrado o test de Fisher para analizar
+asociaciones entre calidad de sueño y variables cualitativas.
+
+El objetivo es evaluar asociaciones entre la calidad del sueño (binaria: “Buena calidad” / “Mala calidad”) y: (a) variables cuantitativas mediante pruebas de medias, y (b) variables cualitativas mediante pruebas de independencia. Se fija α = 0,05.
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+library(scales)
+library(showtext)
+library(lubridate)
+library(stringr)
+library(janitor)
+library(stringi)
+library(scales)
+library(knitr)
+library(tidyr)
+library(purrr)
+library(broom)
+library(knitr)
+
+# Base de datos
+
+cuestionario <- read_excel("Bases de datos/Base de datos.xlsx", 
+                            sheet = "Respuestas del cuestionario") %>%
+  clean_names() %>%
+  filter(
+    tenes_entre_18_a_64_anos_de_edad == "SI",
+    vivis_en_rosario == "SI",
+    consumis_alguna_medicacion_suplemento_descripto_por_un_profesional_para_mejorar_o_modificar_el_sueno == "NO",
+    id >= 1, id <= 100,
+    !is.na(cual_fue_tu_hora_de_acostarte_en_promedio_los_ultimos_7_dias)   # usamos el nombre detectado
+  )
+
+sara <- read_excel("Bases de datos/Base de datos.xlsx",
+                   sheet = "Procesamiento SARA") %>%
+  clean_names() %>%
+  filter(id %in% cuestionario$id)
+
+# Agregamos variables de ingesta diaria
+
+sara_clean <- sara %>%
+  rename(
+    energia_kcal = energia,
+    proteina_g   = proteinas,
+    lipidos_g    = lipidos,
+    fibra_g      = fibra,
+    sat_g        = acidos_grasos_saturados,
+    mono_g       = acidos_grasos_monoinsaturados,
+    poli_g       = acidos_grasos_poliinsaturados
+  ) %>%
+  mutate(
+    # unifica hidratos si tu archivo usa dos nombres distintos
+    carb_g = dplyr::coalesce(hidratos_de_carbono, hidratos_de_carbono_total)
+  )
+
+## 1) Totales por ID (VCT y macros en gramos)
+agg_id <- sara_clean %>%
+  group_by(id) %>%
+  summarise(
+    energia_kcal = sum(energia_kcal, na.rm = TRUE),
+    prot_g       = sum(proteina_g,   na.rm = TRUE),
+    carb_g       = sum(carb_g,       na.rm = TRUE),
+    fat_g        = sum(lipidos_g,    na.rm = TRUE),
+    fibra_g      = sum(fibra_g,      na.rm = TRUE),
+    sat_g        = sum(sat_g,        na.rm = TRUE),
+    mono_g       = sum(mono_g,       na.rm = TRUE),
+    poli_g       = sum(poli_g,       na.rm = TRUE),
+    es_claro     = if_else(
+      all(
+        str_to_upper(str_trim(registro_claro)) == "SI", 
+        na.rm = TRUE
+        ) 
+      & 
+        any(
+          str_to_upper(
+            str_trim(registro_claro)) == "SI", na.rm = TRUE),
+      "SI", "NO"),
+    .groups = "drop"
+  )
+
+## 2) Proteínas por origen (animal vs vegetal)
+# Ajustá el patrón si tus códigos usan otras letras para lácteos/huevo.
+pat_animal <- "^(C|L|Q|U|Y)"  # C: carnes/pescados/huevo; L: lácteos
+
+prot_origen <- sara_clean %>%
+  mutate(codigo = as.character(codigo_del_alimento),
+         es_animal = str_detect(str_to_upper(codigo), pat_animal)) %>%
+  group_by(id) %>%
+  summarise(
+    prot_animal_g = sum(if_else(es_animal, proteina_g, 0), na.rm = TRUE),
+    prot_total_g  = sum(proteina_g, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(prot_vegetal_g = pmax(prot_total_g - prot_animal_g, 0)) %>%
+  select(id, prot_animal_g, prot_vegetal_g)
+
+## 3) Combina y calcula %VCT + azúcares estimados y categorías
+nutri_id <- agg_id %>%
+  left_join(prot_origen, by = "id") %>%
+  mutate(
+    # % de energía por macronutriente (Atwater)
+    pct_kcal_prot = 100 * (prot_g * 4) / energia_kcal,
+    pct_kcal_carb = 100 * (carb_g * 4) / energia_kcal,
+    pct_kcal_fat  = 100 * (fat_g  * 9) / energia_kcal,
+
+    # Azúcares estimados = carbohidratos no fibrosos
+    azucares_g    = pmax(carb_g - fibra_g, 0),
+    pct_azucares  = 100 * (azucares_g * 4) / energia_kcal,
+    azucares_cat  = case_when(
+      is.na(pct_azucares) ~ NA_character_,
+      pct_azucares <= 10  ~ "Adecuado",
+      TRUE                ~ "Alto"
+    ),
+
+    # Fibra por 1000 kcal y categoría (MSal/OMS)
+    fibra_g_1000kcal = 1000 * fibra_g / energia_kcal,
+    fibra_cat = case_when(
+      is.na(fibra_g_1000kcal) ~ NA_character_,
+      fibra_g_1000kcal >= 14  ~ "Adecuado",
+      TRUE                    ~ "Bajo"
+    ),
+
+    # % grasas por tipo y categorías
+    pct_sat  = 100 * (sat_g  * 9) / energia_kcal,
+    pct_mono = 100 * (mono_g * 9) / energia_kcal,
+    pct_poli = 100 * (poli_g * 9) / energia_kcal,
+
+    sat_cat  = case_when(is.na(pct_sat)  ~ NA_character_,
+                         pct_sat  <= 10  ~ "Adecuado",
+                         TRUE            ~ "Alto"),
+    mono_cat = case_when(is.na(pct_mono) ~ NA_character_,
+                         pct_mono <= 20  ~ "Adecuado",
+                         TRUE            ~ "Alto"),
+    poli_cat = case_when(is.na(pct_poli) ~ NA_character_,
+                         pct_poli < 6    ~ "Bajo",
+                         pct_poli <= 11  ~ "Adecuado",
+                         TRUE            ~ "Alto")
+  )
+
+## 4) Variables finales y merge con `cuestionario`
+vars_finales <- nutri_id %>%
+  transmute(
+    id,
+    es_claro, 
+    energia_kcal,
+    # Proteínas
+    prot_g, pct_kcal_prot, prot_animal_g, prot_vegetal_g,
+    # Hidratos
+    carb_g, pct_kcal_carb, fibra_g, fibra_g_1000kcal, fibra_cat,
+    azucares_g, pct_azucares, azucares_cat,
+    # Grasas
+    fat_g, pct_kcal_fat, sat_g, mono_g, poli_g,
+    pct_sat, sat_cat, pct_mono, mono_cat, pct_poli, poli_cat
+  )
+
+cuestionario <- cuestionario %>%
+  left_join(vars_finales, by = "id")
+
+base_completa <- cuestionario %>%
+  # 1) asegurar que TODAS las columnas de texto estén en UTF-8
+  mutate(across(where(is.character), ~ iconv(.x, from = "", to = "UTF-8"))) %>%
+
+  # 2) variables del PSQI usando textos normalizados
+  mutate(
+    calidad_subjetiva_sueno = case_when(
+      (como_valorarias_la_calidad_de_tu_sueno_esta_semana) == "Muy buena"      ~ 0,
+      (como_valorarias_la_calidad_de_tu_sueno_esta_semana) == "Bastante buena" ~ 1,
+      (como_valorarias_la_calidad_de_tu_sueno_esta_semana) == "Bastante mala"  ~ 2,
+      (como_valorarias_la_calidad_de_tu_sueno_esta_semana) == "Mala"           ~ 3,
+      TRUE ~ NA_integer_
+    ),
+
+    minutos_de_sueno = hour(cuantas_horas_calculas_que_dormiste_en_promedio_cada_noche)*60 +
+                       minute(cuantas_horas_calculas_que_dormiste_en_promedio_cada_noche),
+
+    duracion_sueno = case_when(
+      minutos_de_sueno/60 > 7                        ~ 0,
+      minutos_de_sueno/60 > 6 & minutos_de_sueno/60 <= 7 ~ 1,
+      minutos_de_sueno/60 > 5 & minutos_de_sueno/60 <= 6 ~ 2,
+      minutos_de_sueno/60 < 5                         ~ 3,
+      TRUE ~ NA_integer_
+    ),
+
+    tardanza_dormir = case_when(
+      (cuanto_tiempo_tardaste_en_dormir_en_promedio) == "Menos de 15 minutos"   ~ 0,
+      (cuanto_tiempo_tardaste_en_dormir_en_promedio) == "Entre 16 y 30 minutos" ~ 1,
+      (cuanto_tiempo_tardaste_en_dormir_en_promedio) == "Entre 31 y 60 minutos" ~ 2,
+      (cuanto_tiempo_tardaste_en_dormir_en_promedio) == "Más de 60 minutos" ~ 3,
+      TRUE ~ NA_integer_
+    ),
+
+    problemas_dormir = case_when(
+      (cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_conciliar_el_sueno_en_la_primera_media_hora) ==
+        "Ninguna vez en los últimos 7 días" ~ 0,
+      (cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_conciliar_el_sueno_en_la_primera_media_hora) ==
+        "Menos de una vez cada 2 días"      ~ 1,
+      (cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_conciliar_el_sueno_en_la_primera_media_hora) ==
+        "Una o dos veces cada 2 días"       ~ 2,
+      (cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_conciliar_el_sueno_en_la_primera_media_hora) ==
+        "Tres o más veces cada 2 días"      ~ 3,
+      TRUE ~ NA_integer_
+    ),
+
+    latencia_sueno = case_when(
+      (tardanza_dormir + problemas_dormir) == 0       ~ 0,
+      (tardanza_dormir + problemas_dormir) == 1 | tardanza_dormir + problemas_dormir == 2    ~ 1,
+      (tardanza_dormir + problemas_dormir) == 3 | tardanza_dormir + problemas_dormir == 4    ~ 2,
+      (tardanza_dormir + problemas_dormir) == 5 | tardanza_dormir + problemas_dormir == 6    ~ 3,
+      TRUE ~ NA_integer_
+    ),
+
+    # 3) tiempo en cama y eficiencia
+    hora_acostarse  = as.POSIXct(cual_fue_tu_hora_de_acostarte_en_promedio_los_ultimos_7_dias),
+    hora_levantarse = as.POSIXct(a_que_hora_te_levantaste_en_promedio_en_la_ultima_semana),
+    tiempo_cama_min = as.numeric(difftime(hora_levantarse, hora_acostarse, units = "mins")),
+    tiempo_cama_min = ifelse(tiempo_cama_min < 0, tiempo_cama_min + 24*60, tiempo_cama_min),
+    eficiencia_sueno = (minutos_de_sueno / tiempo_cama_min) * 100,
+    eficiencia_sueno = 
+      case_when(
+        eficiencia_sueno >= 85 ~ 0,
+        eficiencia_sueno >= 75 & eficiencia_sueno <= 84 ~ 1,
+        eficiencia_sueno >= 65 & eficiencia_sueno <= 74 ~ 2,
+        eficiencia_sueno < 65 ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_despertarte_durante_la_noche_o_de_madrugada =
+      case_when(
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_despertarte_durante_la_noche_o_de_madrugada == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_despertarte_durante_la_noche_o_de_madrugada == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_despertarte_durante_la_noche_o_de_madrugada == "Una o dos veces cada 2 días" ~ 2,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_despertarte_durante_la_noche_o_de_madrugada == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_que_levantarte_para_ir_al_bano =
+      case_when(
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_que_levantarte_para_ir_al_bano == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_que_levantarte_para_ir_al_bano == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_que_levantarte_para_ir_al_bano == "Una o dos veces cada 2 días" ~ 2,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_que_levantarte_para_ir_al_bano == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_respirar_bien =
+      case_when(
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_respirar_bien == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_respirar_bien == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_respirar_bien == "Una o dos veces cada 2 días" ~ 2,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_respirar_bien == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_toser_o_roncar_ruidosamente =
+      case_when(
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_toser_o_roncar_ruidosamente == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_toser_o_roncar_ruidosamente == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_toser_o_roncar_ruidosamente == "Una o dos veces cada 2 días" ~ 2,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_toser_o_roncar_ruidosamente == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_frio =
+      case_when(
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_frio == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_frio == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_frio == "Una o dos veces cada 2 días" ~ 2,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_frio == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_demasiado_calor =
+      case_when(
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_demasiado_calor == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_demasiado_calor == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_demasiado_calor == "Una o dos veces cada 2 días" ~ 2,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_demasiado_calor == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_pesadillas_o_malos_suenos =
+      case_when(
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_pesadillas_o_malos_suenos == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_pesadillas_o_malos_suenos == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_pesadillas_o_malos_suenos == "Una o dos veces cada 2 días" ~ 2,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_pesadillas_o_malos_suenos == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sufrir_dolores =
+      case_when(
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sufrir_dolores == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sufrir_dolores == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sufrir_dolores == "Una o dos veces cada 2 días" ~ 2,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sufrir_dolores == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    trastornos_sueno =
+      cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_despertarte_durante_la_noche_o_de_madrugada +
+      cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_que_levantarte_para_ir_al_bano +
+      cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_respirar_bien +
+      cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_toser_o_roncar_ruidosamente +
+      cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_frio +
+      cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_demasiado_calor +
+      cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_pesadillas_o_malos_suenos +
+      cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sufrir_dolores,
+    trastornos_sueno =
+      case_when(
+        trastornos_sueno == 0 ~ 0,
+        trastornos_sueno >= 1 & trastornos_sueno<=9 ~ 1,
+        trastornos_sueno >= 10 & trastornos_sueno<=18 ~ 2,
+        trastornos_sueno >= 19 & trastornos_sueno<=27 ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_sentiste_somnolencia_mientras_conducias_comias_o_desarrollabas_alguna_otra_actividad =
+      case_when(
+        cuantas_veces_sentiste_somnolencia_mientras_conducias_comias_o_desarrollabas_alguna_otra_actividad == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_sentiste_somnolencia_mientras_conducias_comias_o_desarrollabas_alguna_otra_actividad == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_sentiste_somnolencia_mientras_conducias_comias_o_desarrollabas_alguna_otra_actividad == "Una o dos veces a cada 2 días" ~ 2,
+        cuantas_veces_sentiste_somnolencia_mientras_conducias_comias_o_desarrollabas_alguna_otra_actividad == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    que_tan_dificil_fue_mantenerse_con_energia_para_realizar_actividades_como_conducir_comer_o_hacer_otras_tareas_diarias_en_la_ultima_semana =
+      case_when(
+        que_tan_dificil_fue_mantenerse_con_energia_para_realizar_actividades_como_conducir_comer_o_hacer_otras_tareas_diarias_en_la_ultima_semana == "Nada dificil" ~ 0,
+        que_tan_dificil_fue_mantenerse_con_energia_para_realizar_actividades_como_conducir_comer_o_hacer_otras_tareas_diarias_en_la_ultima_semana == "Solo un problema leve" ~ 1,
+        que_tan_dificil_fue_mantenerse_con_energia_para_realizar_actividades_como_conducir_comer_o_hacer_otras_tareas_diarias_en_la_ultima_semana == "Un problema" ~ 2,
+        que_tan_dificil_fue_mantenerse_con_energia_para_realizar_actividades_como_conducir_comer_o_hacer_otras_tareas_diarias_en_la_ultima_semana == "Un problema grave" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    disfuncion_diurna = 
+      cuantas_veces_sentiste_somnolencia_mientras_conducias_comias_o_desarrollabas_alguna_otra_actividad + 
+      que_tan_dificil_fue_mantenerse_con_energia_para_realizar_actividades_como_conducir_comer_o_hacer_otras_tareas_diarias_en_la_ultima_semana,
+    disfuncion_diurna = 
+      case_when(
+        disfuncion_diurna == 0 ~ 0,
+        disfuncion_diurna == 1 | disfuncion_diurna == 2 ~ 1,
+        disfuncion_diurna == 3 | disfuncion_diurna == 4 ~ 2,
+        disfuncion_diurna == 5 | disfuncion_diurna == 6 ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    Pittsburgh = 
+      calidad_subjetiva_sueno +
+      duracion_sueno +
+      latencia_sueno +
+      eficiencia_sueno +
+      trastornos_sueno +
+      disfuncion_diurna,
+    calidad_sueno =
+      if_else(Pittsburgh <= 5, "Buena calidad","Mala calidad")
+  )
+
+# Base limpia para test
+dat <- base_completa %>%
+  filter(!is.na(calidad_sueno)) %>%
+  mutate(calidad_sueno = factor(calidad_sueno,
+                                levels = c("Buena calidad","Mala calidad")))
+
+# ---------- Helpers ----------
+cohen_d <- function(x, g){
+  g1 <- levels(g)[1]; g2 <- levels(g)[2]
+  x1 <- x[g==g1]; x2 <- x[g==g2]
+  n1 <- length(x1); n2 <- length(x2)
+  s1 <- sd(x1); s2 <- sd(x2)
+  sp <- sqrt(((n1-1)*s1^2 + (n2-1)*s2^2)/(n1+n2-2))
+  (mean(x2)-mean(x1))/sp
+}
+
+cliffs_delta <- function(x1, x2){
+  m <- outer(x1, x2, `-`)
+  (sum(m>0) - sum(m<0)) / (length(x1)*length(x2))
+}
+
+cramers_v <- function(tab){
+  chi2 <- suppressWarnings(chisq.test(tab, correct = FALSE)$statistic)
+  n <- sum(tab)
+  k <- min(nrow(tab)-1, ncol(tab)-1)
+  as.numeric(sqrt(chi2/(n*k)))
+}
+
+# ---------- Numéricas: t / Mann-Whitney ----------
+test_numeric <- function(df, var, group = "calidad_sueno"){
+  x <- df %>% select(all_of(c(group, var))) %>% na.omit()
+  g <- x[[group]]; y <- x[[var]]
+
+  # Normalidad por grupo (Shapiro; si n<3 -> NA)
+  p_norm <- suppressWarnings({
+    p1 <- if(sum(g==levels(g)[1])>=3) shapiro.test(y[g==levels(g)[1]])$p.value else NA
+    p2 <- if(sum(g==levels(g)[2])>=3) shapiro.test(y[g==levels(g)[2]])$p.value else NA
+    min(p1, p2, na.rm = TRUE)
+  })
+
+  # Homogeneidad de varianzas (solo informativa)
+  p_var <- suppressWarnings(tryCatch(var.test(y ~ g)$p.value, error = function(e) NA_real_))
+
+  if(!is.na(p_norm) && p_norm > 0.05){
+    tt <- t.test(y ~ g, var.equal = (!is.na(p_var) && p_var > 0.05))
+    d  <- cohen_d(y, g)
+    tibble(
+      variable   = var,
+      n1 = sum(g==levels(g)[1]), n2 = sum(g==levels(g)[2]),
+      test = ifelse(!is.na(p_var) && p_var > 0.05, "t (var iguales)", "t (Welch)"),
+      estadistico = unname(tt$statistic),
+      p_value = tt$p.value,
+      efecto = d,
+      medida_efecto = "Cohen d"
+    )
+  } else {
+    ww <- wilcox.test(y ~ g, exact = FALSE)
+    dlt <- cliffs_delta(y[g==levels(g)[1]], y[g==levels(g)[2]])
+    tibble(
+      variable   = var,
+      n1 = sum(g==levels(g)[1]), n2 = sum(g==levels(g)[2]),
+      test = "Mann-Whitney",
+      estadistico = unname(ww$statistic),
+      p_value = ww$p.value,
+      efecto = dlt,
+      medida_efecto = "Cliff’s delta"
+    )
+  }
+}
+
+# ---------- Categóricas: χ² / Fisher ----------
+test_categorical <- function(df, var, group = "calidad_sueno"){
+  x <- df %>% select(all_of(c(group, var))) %>% filter(!is.na(.data[[group]]), !is.na(.data[[var]]))
+  tab <- table(x[[group]], x[[var]])
+  chi <- suppressWarnings(chisq.test(tab, correct = FALSE))
+  need_fisher <- any(chi$expected < 5)
+  if(need_fisher){
+    ft <- fisher.test(tab)
+    tibble(
+      variable = var,
+      niveles = ncol(tab),
+      test = "Fisher",
+      estadistico = NA_real_,
+      p_value = ft$p.value,
+      efecto = cramers_v(tab),
+      medida_efecto = "V de Cramér"
+    )
+  } else {
+    tibble(
+      variable = var,
+      niveles = ncol(tab),
+      test = "Chi-cuadrado",
+      estadistico = unname(chi$statistic),
+      p_value = chi$p.value,
+      efecto = cramers_v(tab),
+      medida_efecto = "V de Cramér"
+    )
+  }
+}
+
+# ---------- Ejecutar en lote ----------
+# Define tus variables
+vars_numericas  <- c("prot_g","carb_g","fat_g","pct_kcal_prot","pct_kcal_carb","pct_kcal_fat",
+                     "prot_animal_g", "prot_vegetal_g", "fibra_g","pct_azucares","pct_sat","pct_mono","pct_poli")
+
+vars_categoricas <- c("fibra_cat","azucares_cat","sat_cat","mono_cat","poli_cat")
+
+res_num <- map_dfr(vars_numericas, ~ test_numeric(dat, .x)) %>%
+  mutate(p_value = signif(p_value, 3),
+         estadistico = round(estadistico, 3),
+         efecto = round(efecto, 3))
+
+res_cat <- map_dfr(vars_categoricas, ~ test_categorical(dat, .x)) %>%
+  mutate(p_value = signif(p_value, 3),
+         estadistico = round(estadistico, 3),
+         efecto = round(efecto, 3))
+```
+
+# Pruebas para variables cuantitativas
+
+Para cada variable numérica, se compara su distribución entre los dos grupos de calidad de sueño con la finalidad de identificar qué test emplear. Dicha comparación se realiza a través de un test de _Shapiro–Wilk_.
+
+Si ambos grupos no rechazan normalidad (p>0,05), se usa _t de Student_. En caso contrario, se usa _Mann–Whitney_.
+
+Además, en el t-test se chequea homogeneidad de varianzas con un F-test informativo: si p>0,05 se usa t con varianzas iguales; si no, Welch (varianzas desiguales).
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+res_num %>%
+  kable(caption = "Asociación entre calidad de sueño y variables numéricas",
+        align = "lrrllll") %>%
+  kable_styling(full_width = TRUE, bootstrap_options = c("striped","hover","condensed"))
+```
+
+Ninguna variable alcanza p < 0,05. No hay diferencias estadísticamente significativas entre la calidad del sueño y las ingestas/porcentajes evaluados en el análisis bivariado.
+
+Todos los efectos son pequeños o triviales: |Cohen’s d| ≤ 0,27; |Cliff’s δ| ≤ 0,25.
+
+Indicios (no significativos):
+
+- Fibra (g): p=0,100; δ=0,246 → ligera tendencia a más fibra en “Buena calidad”.
+- % azúcares (VCT): p=0,429; d=+0,204 → leve tendencia a más azúcares en “Mala calidad”.
+- % proteínas (VCT): p=0,229; d=−0,272 → leve tendencia a menor % de proteínas en “Mala calidad”.
+- El resto (carbohidratos, grasa total y por tipos) muestra diferencias próximas a cero.
+
+**Conclusión**
+Con los tamaños muestrales actuales, no se observa asociación estadística entre la calidad del sueño y las variables nutricionales analizadas. Si existen diferencias, su magnitud es pequeña.
+
+**Sugerencias para futuros análisis**
+Controlar posibles confusores (edad, sexo, energía total) con regresión logística para “Buena/Mala calidad” y estimar potencia/IC de los tamaños de efecto para contextualizar la ausencia de significación.
+
+# Pruebas para variables cuanlitativas
+
+Para cada variable categórica, se construye la tabla de contingencia (calidad del sueño × variable) y se intenta probar _test de_ $\chi^2$ sin corrección; si alguna frecuencia esperada <5, se aplica test exacto de Fisher.
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+res_cat %>%
+  kable(caption = "Asociación entre calidad de sueño y variables categóricas",
+        align = "lrccll") %>%
+  kable_styling(full_width = TRUE, bootstrap_options = c("striped","hover","condensed"))
+```
+
+En general no hay asociación estadísticamente significativa entre calidad del sueño y las categorías nutricionales evaluadas (todas con p≥0.147).
+
+**Conclusión**
+Con esta muestra, no se detectan asociaciones significativas entre calidad del sueño y las categorías de fibra/azúcares/grasas; los tamaños de efecto son pequeños. La única señal débil es la categoría de adecuación de consumo de fibra. 
+
+**Sugerencias para futuros análisis**
+Se podría confirmar con regresión logística ajustando por edad, sexo y energía total, considerar colapsar categorías poco frecuentes (por ejemplo, cantidad de grasas poliinsaturadas consumidas) para ganar potencia, o chequear datos perdidos.
+
+# Conclusión final
+
+**Descriptivo.** La muestra presentó un puntaje Pittsburgh medio ≈5,3 (DE≈2,5); 66% con “buena calidad” y 34% con “mala calidad”. La ingesta de hidratos promedió ≈162 g/día, con composición dominada por fracciones no fibrosas/azúcares (~89%) y fibra baja (~11%); muchas personas no alcanzan 14 g/1000 kcal. En el perfil lipídico predominaron las monoinsaturadas (~37%), seguidas por saturadas (~32%) y poliinsaturadas (~22%); frecuentemente las saturadas superan 10% del VCT y las poliinsaturadas quedan por debajo de 6%.
+
+**Inferencial.** No se detectaron asociaciones estadísticamente significativas entre calidad del sueño y las variables nutricionales (cuantitativas ni cualitativas). Los tamaños de efecto fueron pequeños, con señales débiles no concluyentes para mayor fibra en “buena calidad” y una relación casi significativa con la claridad del registro (“es_claro”).
+
+**Interpretación.** El resultado “no significativo” también es un resultado: sugiere que, con estos datos y este tamaño muestral, las diferencias —si existen— son pequeñas o requieren diseños/mediciones más precisas para ser detectadas.
+
+Posibles limitaciones.
+
+- Instrumento de recolección: el recordatorio/encuesta tuvo respuesta de relleno libre, sin control fino del nivel de detalle (preparaciones, tamaños de porción, marcas), lo que introduce heterogeneidad y omisiones.
+- Procesamiento SARA: aunque se utilizó un atlas estándar, el criterio humano en la codificación introduce variabilidad y posibles confusiones (misclasificación de alimentos, origen animal/vegetal, tipos de grasa).
+- Medición de sueño: PSQI auto-reportado y variables derivadas (tiempo en cama, eficiencia) susceptibles a sesgo de recuerdo y a errores en horas AM/PM.
+- Variabilidad intraindividual: un único día de ingesta no siempre representa el consumo habitual.
+- Potencia estadística: subgrupos pequeños y múltiples comparaciones reducen la capacidad de detectar efectos modestos.
+
+**Implicancias y próximos pasos.**
+
+- Mejorar la calidad del dato de ingesta
+- Formularios estructurados con opciones guiadas, fotos de porciones y validaciones en tiempo real.
+- ≥2–3 recordatorios no consecutivos por persona o diario de 7 días; complementar con FFQ para “ingesta habitual”.
+- Refinar la medición de sueño
+- Modelado multivariable
+- Regresión logística para “buena/mala calidad” ajustando por edad, sexo, energía total, IMC, actividad física, cronotipo.
+- Sensibilidades: excluir sub/ sobre-reportes, redefinir cortes (azúcares, fibra, grasas), colapsar categorías raras.
+
+Aun sin asociaciones claras, el análisis revela un patrón de HC con azúcares altos y fibra insuficiente, y un perfil lipídico con exceso de saturadas y déficit de poliinsaturadas. Las limitaciones del relleno libre y del procesamiento subjetivo explican parte de la imprecisión. El estudio abre la puerta a un diseño de seguimiento con mediciones más estandarizadas y modelos ajustados que permitan estimar con mayor fidelidad la relación entre calidad del sueño y calidad de la dieta.

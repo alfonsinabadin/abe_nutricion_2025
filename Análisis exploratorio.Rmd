@@ -1,0 +1,903 @@
+---
+title: "Análisis exploratorio"
+output: 
+  html_document:
+    theme: flatly
+    toc: no
+css: Back/styles.css
+---
+
+Se realizará un análisis descriptivo/exploratorio para resumir y caracterizar la 
+información recolectada. Para ello se utilizarán medidas de tendencia central (media,
+mediana), medidas de dispersión (desvío estándar, rango intercuartílico) y frecuencias
+absolutas y relativas, según el tipo de variable. Además, se incluirán tablas de frecuencia
+y gráficos que expresen la naturaleza de las variables y den un indicio de su posible relación
+(gráfico de barras, gráfico de dispersión tridimensional, gráfico de sectores, histogramas,
+entre otros).
+
+Previo al análisis, se realizó un procesamiento de los datos disponibles para obtener las variables
+presentadas en el informe, que son:
+
+- Cantidad de proteínas consumidas
+- Porcentaje de proteínas según VCT
+- Consumo de proteínas de origen animal
+- Consumo de proteínas de origen vegetal
+- Cantidad de hidratos de carbonos consumidos
+- Porcentaje de hidratos de carbonos según VCT
+- Cantidad de fibra consumida
+- Cantidad de azucares consumidos (se estima como total de HC - total de fibras, ya que SARA no discrimina los azúcares)
+- Cantidad de grasas consumidas
+- Porcentaje de grasas según VCT
+- Cantidad de grasas saturadas consumidas
+- Cantidad de grasas monoinsaturadas consumidas
+- Cantidad de grasas poliinsaturadas consumidas
+
+```{r echo=FALSE, results='hide', warning=FALSE, message=FALSE}
+# Librerías
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+library(scales)
+library(showtext)
+library(lubridate)
+library(stringr)
+library(janitor)
+library(stringi)
+library(scales)
+library(knitr)
+library(tidyr)
+
+font_add_google("Lato", "Lato")
+showtext_auto()
+
+# Base de datos
+
+cuestionario <- read_excel("Bases de datos/Base de datos.xlsx", 
+                            sheet = "Respuestas del cuestionario") %>%
+  clean_names() %>%
+  filter(
+    tenes_entre_18_a_64_anos_de_edad == "SI",
+    vivis_en_rosario == "SI",
+    consumis_alguna_medicacion_suplemento_descripto_por_un_profesional_para_mejorar_o_modificar_el_sueno == "NO",
+    id >= 1, id <= 100,
+    !is.na(cual_fue_tu_hora_de_acostarte_en_promedio_los_ultimos_7_dias)   # usamos el nombre detectado
+  )
+
+sara <- read_excel("Bases de datos/Base de datos.xlsx",
+                   sheet = "Procesamiento SARA") %>%
+  clean_names() %>%
+  filter(id %in% cuestionario$id)
+
+# Agregamos variables de ingesta diaria
+
+sara_clean <- sara %>%
+  rename(
+    energia_kcal = energia,
+    proteina_g   = proteinas,
+    lipidos_g    = lipidos,
+    fibra_g      = fibra,
+    sat_g        = acidos_grasos_saturados,
+    mono_g       = acidos_grasos_monoinsaturados,
+    poli_g       = acidos_grasos_poliinsaturados
+  ) %>%
+  mutate(
+    # unifica hidratos si tu archivo usa dos nombres distintos
+    carb_g = dplyr::coalesce(hidratos_de_carbono, hidratos_de_carbono_total)
+  )
+
+## 1) Totales por ID (VCT y macros en gramos)
+agg_id <- sara_clean %>%
+  group_by(id) %>%
+  summarise(
+    energia_kcal = sum(energia_kcal, na.rm = TRUE),
+    prot_g       = sum(proteina_g,   na.rm = TRUE),
+    carb_g       = sum(carb_g,       na.rm = TRUE),
+    fat_g        = sum(lipidos_g,    na.rm = TRUE),
+    fibra_g      = sum(fibra_g,      na.rm = TRUE),
+    sat_g        = sum(sat_g,        na.rm = TRUE),
+    mono_g       = sum(mono_g,       na.rm = TRUE),
+    poli_g       = sum(poli_g,       na.rm = TRUE),
+    es_claro     = if_else(
+      all(
+        str_to_upper(str_trim(registro_claro)) == "SI", 
+        na.rm = TRUE
+        ) 
+      & 
+        any(
+          str_to_upper(
+            str_trim(registro_claro)) == "SI", na.rm = TRUE),
+      "SI", "NO"),
+    .groups = "drop"
+  )
+
+## 2) Proteínas por origen (animal vs vegetal)
+# Ajustá el patrón si tus códigos usan otras letras para lácteos/huevo.
+pat_animal <- "^(C|L|Q|U|Y)"  # C: carnes/pescados/huevo; L: lácteos
+
+prot_origen <- sara_clean %>%
+  mutate(codigo = as.character(codigo_del_alimento),
+         es_animal = str_detect(str_to_upper(codigo), pat_animal)) %>%
+  group_by(id) %>%
+  summarise(
+    prot_animal_g = sum(if_else(es_animal, proteina_g, 0), na.rm = TRUE),
+    prot_total_g  = sum(proteina_g, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(prot_vegetal_g = pmax(prot_total_g - prot_animal_g, 0)) %>%
+  select(id, prot_animal_g, prot_vegetal_g)
+
+## 3) Combina y calcula %VCT + azúcares estimados y categorías
+nutri_id <- agg_id %>%
+  left_join(prot_origen, by = "id") %>%
+  mutate(
+    # % de energía por macronutriente (Atwater)
+    pct_kcal_prot = 100 * (prot_g * 4) / energia_kcal,
+    pct_kcal_carb = 100 * (carb_g * 4) / energia_kcal,
+    pct_kcal_fat  = 100 * (fat_g  * 9) / energia_kcal,
+
+    # Azúcares estimados = carbohidratos no fibrosos
+    azucares_g    = pmax(carb_g - fibra_g, 0),
+    pct_azucares  = 100 * (azucares_g * 4) / energia_kcal,
+    azucares_cat  = case_when(
+      is.na(pct_azucares) ~ NA_character_,
+      pct_azucares <= 10  ~ "Adecuado",
+      TRUE                ~ "Alto"
+    ),
+
+    # Fibra por 1000 kcal y categoría (MSal/OMS)
+    fibra_g_1000kcal = 1000 * fibra_g / energia_kcal,
+    fibra_cat = case_when(
+      is.na(fibra_g_1000kcal) ~ NA_character_,
+      fibra_g_1000kcal >= 14  ~ "Adecuado",
+      TRUE                    ~ "Bajo"
+    ),
+
+    # % grasas por tipo y categorías
+    pct_sat  = 100 * (sat_g  * 9) / energia_kcal,
+    pct_mono = 100 * (mono_g * 9) / energia_kcal,
+    pct_poli = 100 * (poli_g * 9) / energia_kcal,
+
+    sat_cat  = case_when(is.na(pct_sat)  ~ NA_character_,
+                         pct_sat  <= 10  ~ "Adecuado",
+                         TRUE            ~ "Alto"),
+    mono_cat = case_when(is.na(pct_mono) ~ NA_character_,
+                         pct_mono <= 20  ~ "Adecuado",
+                         TRUE            ~ "Alto"),
+    poli_cat = case_when(is.na(pct_poli) ~ NA_character_,
+                         pct_poli < 6    ~ "Bajo",
+                         pct_poli <= 11  ~ "Adecuado",
+                         TRUE            ~ "Alto")
+  )
+
+## 4) Variables finales y merge con `cuestionario`
+vars_finales <- nutri_id %>%
+  transmute(
+    id,
+    es_claro, 
+    energia_kcal,
+    # Proteínas
+    prot_g, pct_kcal_prot, prot_animal_g, prot_vegetal_g,
+    # Hidratos
+    carb_g, pct_kcal_carb, fibra_g, fibra_g_1000kcal, fibra_cat,
+    azucares_g, pct_azucares, azucares_cat,
+    # Grasas
+    fat_g, pct_kcal_fat, sat_g, mono_g, poli_g,
+    pct_sat, sat_cat, pct_mono, mono_cat, pct_poli, poli_cat
+  )
+
+cuestionario <- cuestionario %>%
+  left_join(vars_finales, by = "id")
+
+base_completa <- cuestionario %>%
+  # 1) asegurar que TODAS las columnas de texto estén en UTF-8
+  mutate(across(where(is.character), ~ iconv(.x, from = "", to = "UTF-8"))) %>%
+
+  # 2) variables del PSQI usando textos normalizados
+  mutate(
+    calidad_subjetiva_sueno = case_when(
+      (como_valorarias_la_calidad_de_tu_sueno_esta_semana) == "Muy buena"      ~ 0,
+      (como_valorarias_la_calidad_de_tu_sueno_esta_semana) == "Bastante buena" ~ 1,
+      (como_valorarias_la_calidad_de_tu_sueno_esta_semana) == "Bastante mala"  ~ 2,
+      (como_valorarias_la_calidad_de_tu_sueno_esta_semana) == "Mala"           ~ 3,
+      TRUE ~ NA_integer_
+    ),
+
+    minutos_de_sueno = hour(cuantas_horas_calculas_que_dormiste_en_promedio_cada_noche)*60 +
+                       minute(cuantas_horas_calculas_que_dormiste_en_promedio_cada_noche),
+
+    duracion_sueno = case_when(
+      minutos_de_sueno/60 > 7                        ~ 0,
+      minutos_de_sueno/60 > 6 & minutos_de_sueno/60 <= 7 ~ 1,
+      minutos_de_sueno/60 > 5 & minutos_de_sueno/60 <= 6 ~ 2,
+      minutos_de_sueno/60 < 5                         ~ 3,
+      TRUE ~ NA_integer_
+    ),
+
+    tardanza_dormir = case_when(
+      (cuanto_tiempo_tardaste_en_dormir_en_promedio) == "Menos de 15 minutos"   ~ 0,
+      (cuanto_tiempo_tardaste_en_dormir_en_promedio) == "Entre 16 y 30 minutos" ~ 1,
+      (cuanto_tiempo_tardaste_en_dormir_en_promedio) == "Entre 31 y 60 minutos" ~ 2,
+      (cuanto_tiempo_tardaste_en_dormir_en_promedio) == "Más de 60 minutos" ~ 3,
+      TRUE ~ NA_integer_
+    ),
+
+    problemas_dormir = case_when(
+      (cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_conciliar_el_sueno_en_la_primera_media_hora) ==
+        "Ninguna vez en los últimos 7 días" ~ 0,
+      (cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_conciliar_el_sueno_en_la_primera_media_hora) ==
+        "Menos de una vez cada 2 días"      ~ 1,
+      (cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_conciliar_el_sueno_en_la_primera_media_hora) ==
+        "Una o dos veces cada 2 días"       ~ 2,
+      (cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_conciliar_el_sueno_en_la_primera_media_hora) ==
+        "Tres o más veces cada 2 días"      ~ 3,
+      TRUE ~ NA_integer_
+    ),
+
+    latencia_sueno = case_when(
+      (tardanza_dormir + problemas_dormir) == 0       ~ 0,
+      (tardanza_dormir + problemas_dormir) == 1 | tardanza_dormir + problemas_dormir == 2    ~ 1,
+      (tardanza_dormir + problemas_dormir) == 3 | tardanza_dormir + problemas_dormir == 4    ~ 2,
+      (tardanza_dormir + problemas_dormir) == 5 | tardanza_dormir + problemas_dormir == 6    ~ 3,
+      TRUE ~ NA_integer_
+    ),
+
+    # 3) tiempo en cama y eficiencia
+    hora_acostarse  = as.POSIXct(cual_fue_tu_hora_de_acostarte_en_promedio_los_ultimos_7_dias),
+    hora_levantarse = as.POSIXct(a_que_hora_te_levantaste_en_promedio_en_la_ultima_semana),
+    tiempo_cama_min = as.numeric(difftime(hora_levantarse, hora_acostarse, units = "mins")),
+    tiempo_cama_min = ifelse(tiempo_cama_min < 0, tiempo_cama_min + 24*60, tiempo_cama_min),
+    eficiencia_sueno = (minutos_de_sueno / tiempo_cama_min) * 100,
+    eficiencia_sueno = 
+      case_when(
+        eficiencia_sueno >= 85 ~ 0,
+        eficiencia_sueno >= 75 & eficiencia_sueno <= 84 ~ 1,
+        eficiencia_sueno >= 65 & eficiencia_sueno <= 74 ~ 2,
+        eficiencia_sueno < 65 ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_despertarte_durante_la_noche_o_de_madrugada =
+      case_when(
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_despertarte_durante_la_noche_o_de_madrugada == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_despertarte_durante_la_noche_o_de_madrugada == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_despertarte_durante_la_noche_o_de_madrugada == "Una o dos veces cada 2 días" ~ 2,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_despertarte_durante_la_noche_o_de_madrugada == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_que_levantarte_para_ir_al_bano =
+      case_when(
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_que_levantarte_para_ir_al_bano == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_que_levantarte_para_ir_al_bano == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_que_levantarte_para_ir_al_bano == "Una o dos veces cada 2 días" ~ 2,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_que_levantarte_para_ir_al_bano == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_respirar_bien =
+      case_when(
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_respirar_bien == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_respirar_bien == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_respirar_bien == "Una o dos veces cada 2 días" ~ 2,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_respirar_bien == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_toser_o_roncar_ruidosamente =
+      case_when(
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_toser_o_roncar_ruidosamente == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_toser_o_roncar_ruidosamente == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_toser_o_roncar_ruidosamente == "Una o dos veces cada 2 días" ~ 2,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_toser_o_roncar_ruidosamente == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_frio =
+      case_when(
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_frio == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_frio == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_frio == "Una o dos veces cada 2 días" ~ 2,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_frio == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_demasiado_calor =
+      case_when(
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_demasiado_calor == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_demasiado_calor == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_demasiado_calor == "Una o dos veces cada 2 días" ~ 2,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_demasiado_calor == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_pesadillas_o_malos_suenos =
+      case_when(
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_pesadillas_o_malos_suenos == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_pesadillas_o_malos_suenos == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_pesadillas_o_malos_suenos == "Una o dos veces cada 2 días" ~ 2,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_pesadillas_o_malos_suenos == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sufrir_dolores =
+      case_when(
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sufrir_dolores == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sufrir_dolores == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sufrir_dolores == "Una o dos veces cada 2 días" ~ 2,
+        cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sufrir_dolores == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    trastornos_sueno =
+      cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_despertarte_durante_la_noche_o_de_madrugada +
+      cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_que_levantarte_para_ir_al_bano +
+      cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_no_poder_respirar_bien +
+      cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_toser_o_roncar_ruidosamente +
+      cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_frio +
+      cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sentir_demasiado_calor +
+      cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_tener_pesadillas_o_malos_suenos +
+      cuantas_veces_tuviste_problemas_para_dormir_a_causa_de_sufrir_dolores,
+    trastornos_sueno =
+      case_when(
+        trastornos_sueno == 0 ~ 0,
+        trastornos_sueno >= 1 & trastornos_sueno<=9 ~ 1,
+        trastornos_sueno >= 10 & trastornos_sueno<=18 ~ 2,
+        trastornos_sueno >= 19 & trastornos_sueno<=27 ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    cuantas_veces_sentiste_somnolencia_mientras_conducias_comias_o_desarrollabas_alguna_otra_actividad =
+      case_when(
+        cuantas_veces_sentiste_somnolencia_mientras_conducias_comias_o_desarrollabas_alguna_otra_actividad == "Ninguna vez en los últimos 7 días" ~ 0,
+        cuantas_veces_sentiste_somnolencia_mientras_conducias_comias_o_desarrollabas_alguna_otra_actividad == "Menos de una vez cada 2 días" ~ 1,
+        cuantas_veces_sentiste_somnolencia_mientras_conducias_comias_o_desarrollabas_alguna_otra_actividad == "Una o dos veces a cada 2 días" ~ 2,
+        cuantas_veces_sentiste_somnolencia_mientras_conducias_comias_o_desarrollabas_alguna_otra_actividad == "Tres o más veces cada 2 días" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    que_tan_dificil_fue_mantenerse_con_energia_para_realizar_actividades_como_conducir_comer_o_hacer_otras_tareas_diarias_en_la_ultima_semana =
+      case_when(
+        que_tan_dificil_fue_mantenerse_con_energia_para_realizar_actividades_como_conducir_comer_o_hacer_otras_tareas_diarias_en_la_ultima_semana == "Nada dificil" ~ 0,
+        que_tan_dificil_fue_mantenerse_con_energia_para_realizar_actividades_como_conducir_comer_o_hacer_otras_tareas_diarias_en_la_ultima_semana == "Solo un problema leve" ~ 1,
+        que_tan_dificil_fue_mantenerse_con_energia_para_realizar_actividades_como_conducir_comer_o_hacer_otras_tareas_diarias_en_la_ultima_semana == "Un problema" ~ 2,
+        que_tan_dificil_fue_mantenerse_con_energia_para_realizar_actividades_como_conducir_comer_o_hacer_otras_tareas_diarias_en_la_ultima_semana == "Un problema grave" ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    disfuncion_diurna = 
+      cuantas_veces_sentiste_somnolencia_mientras_conducias_comias_o_desarrollabas_alguna_otra_actividad + 
+      que_tan_dificil_fue_mantenerse_con_energia_para_realizar_actividades_como_conducir_comer_o_hacer_otras_tareas_diarias_en_la_ultima_semana,
+    disfuncion_diurna = 
+      case_when(
+        disfuncion_diurna == 0 ~ 0,
+        disfuncion_diurna == 1 | disfuncion_diurna == 2 ~ 1,
+        disfuncion_diurna == 3 | disfuncion_diurna == 4 ~ 2,
+        disfuncion_diurna == 5 | disfuncion_diurna == 6 ~ 3,
+        TRUE ~ NA_integer_
+      ),
+    Pittsburgh = 
+      calidad_subjetiva_sueno +
+      duracion_sueno +
+      latencia_sueno +
+      eficiencia_sueno +
+      trastornos_sueno +
+      disfuncion_diurna,
+    calidad_sueno =
+      if_else(Pittsburgh <= 5, "Buena calidad","Mala calidad")
+  )
+```
+
+# Variables socio-demográficas
+
+## Rango de edad
+
+<div style="display:flex; align-items:flex-start;">
+<div style="width:40%; padding-right:15px;">
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.align='center'}
+tabla <- table(base_completa$marque_entre_que_rango_de_edad_se_encuentra, useNA = "ifany")
+frec_abs <- as.numeric(tabla)
+frec_rel <- round(prop.table(tabla) * 100, 1)
+
+df_tabla <- data.frame(
+  Categoría = names(tabla),
+  Frecuencia = frec_abs,
+  Porcentaje = paste0(frec_rel, "%")
+)
+
+# Agregar fila de totales
+tabla_final <- rbind(
+  df_tabla,
+  data.frame(
+    Categoría = "Total",
+    Frecuencia = sum(frec_abs),
+    Porcentaje = "100%"
+  )
+)
+
+# Export de tabla
+tabla_final %>%
+  kable(
+    caption = "Tabla 1. Frecuencia absoluta y relativa según el rango de edad",
+    align = c("l", "r", "r")   # primera col a la izq, las numéricas a la derecha
+  ) %>%
+  kable_styling(
+    full_width = TRUE,
+    bootstrap_options = c("striped", "hover", "condensed"),
+    position = "center"
+  ) %>%
+  row_spec(nrow(tabla_final), bold = TRUE)   # última fila (Total) en negrita
+```
+
+</div>
+<div style="width:60%; padding-left:15px;">
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.align='center'}
+data <- df_tabla %>%
+  mutate(Frecuencia = as.numeric(Frecuencia),
+         Porcentaje = Frecuencia / sum(Frecuencia))
+
+theme_set(theme_minimal(base_family = "Lato")) 
+
+# Pie con ggplot
+ggplot(data, aes(x = "", y = Frecuencia, fill = Categoría)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = scales::percent(Frecuencia / sum(Frecuencia), accuracy = 0.1)),
+            position = position_stack(vjust = 0.5),
+            size = 8, color = "black", family = "Lato") +
+  scale_fill_manual(values = c("#A75F37", "#CA8E83", "#D9B9A0", 
+                               "#F2D5CD", "#F1E7DD", "#7A958F", "#B9E0D9")) +
+  labs(title = "Figura 1. Distribución por rango de edad") +
+  theme_void(base_family = "Lato") +
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 20),
+    legend.title = element_text(size = 20),
+    plot.title = element_text(hjust = 0.5, 
+                              family = "Lato", 
+                              size = 25, 
+                              color = '#95a5a6',
+                              margin=margin(10,0,0,0)),
+    panel.background = element_rect(fill = 'white', 
+                                    colour = NA),
+    plot.background = element_rect(fill = 'white', 
+                                   colour = NA)
+  )
+```
+
+</div>
+</div>
+
+## Sexo
+
+<div style="display:flex; align-items:flex-start;">
+<div style="width:40%; padding-right:15px;">
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.align='center'}
+tabla <- table(base_completa$cual_es_su_sexo, useNA = "ifany")
+frec_abs <- as.numeric(tabla)
+frec_rel <- round(prop.table(tabla) * 100, 1)
+
+df_tabla <- data.frame(
+  Categoría = names(tabla),
+  Frecuencia = frec_abs,
+  Porcentaje = paste0(frec_rel, "%")
+)
+
+# Agregar fila de totales
+tabla_final <- rbind(
+  df_tabla,
+  data.frame(
+    Categoría = "Total",
+    Frecuencia = sum(frec_abs),
+    Porcentaje = "100%"
+  )
+)
+
+# Export de tabla
+tabla_final %>%
+  kable(
+    caption = "Tabla 2. Frecuencia absoluta y relativa según el sexo del individuo",
+    align = c("l", "r", "r")   # primera col a la izq, las numéricas a la derecha
+  ) %>%
+  kable_styling(
+    full_width = TRUE,
+    bootstrap_options = c("striped", "hover", "condensed"),
+    position = "center"
+  ) %>%
+  row_spec(nrow(tabla_final), bold = TRUE)   # última fila (Total) en negrita
+```
+
+</div>
+<div style="width:60%; padding-left:15px;">
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.align='center'}
+data <- df_tabla %>%
+  mutate(Frecuencia = as.numeric(Frecuencia),
+         Porcentaje = Frecuencia / sum(Frecuencia))
+
+theme_set(theme_minimal(base_family = "Lato")) 
+
+# Pie con ggplot
+ggplot(data, aes(x = "", y = Frecuencia, fill = Categoría)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = scales::percent(Frecuencia / sum(Frecuencia), accuracy = 0.1)),
+            position = position_stack(vjust = 0.5),
+            size = 8, color = "black", family = "Lato") +
+  scale_fill_manual(values = c("#CA8E83","#7A958F")) +
+  labs(title = "Figura 2. Distribución por sexo") +
+  theme_void(base_family = "Lato") +
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 20),
+    legend.title = element_text(size = 20),
+    plot.title = element_text(hjust = 0.5, 
+                              family = "Lato", 
+                              size = 25, 
+                              color = '#95a5a6',
+                              margin=margin(10,0,0,0)),
+    panel.background = element_rect(fill = 'white', 
+                                    colour = NA),
+    plot.background = element_rect(fill = 'white', 
+                                   colour = NA)
+  )
+```
+
+</div>
+</div>
+
+# Variables nutricionales
+
+## Ingesta de proteínas
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.align='center'}
+tabla_prot <- base_completa %>%
+  mutate(
+    Origen = if_else(prot_animal_g > 0, "Con carnes y derivados", "Sin carnes")
+  ) %>%
+  group_by(Origen) %>%
+  summarise(
+    Min    = min(prot_g, na.rm = TRUE),
+    Media  = mean(prot_g, na.rm = TRUE),
+    Máximo = max(prot_g, na.rm = TRUE),
+    Desvío = sd(prot_g, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  bind_rows(
+    cuestionario %>%
+      summarise(
+        Origen = "Total",
+        Min    = min(prot_g, na.rm = TRUE),
+        Media  = mean(prot_g, na.rm = TRUE),
+        Máximo = max(prot_g, na.rm = TRUE),
+        Desvío = sd(prot_g, na.rm = TRUE)
+      )
+  ) %>%
+  mutate(across(c(Min, Media, Máximo, Desvío), ~ round(.x, 1)))
+
+tabla_prot %>%
+  kable(caption = "Tabla 3. Medidas resumen de la ingesta de proteínas por origen",
+        align = "lrrrr") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed"))
+
+ggplot(cuestionario %>%
+         mutate(Origen = if_else(prot_animal_g > 0, "Con carnes y derivados", "Sin carnes")),
+       aes(x = Origen, y = pct_kcal_prot, fill = Origen)) +
+  geom_boxplot(width = 0.65, outlier.alpha = 0.35) +
+  scale_fill_manual(values = c("Sin carnes" = "#D9B9A0", "Con carnes y derivados" = "#B9E0D9")) +
+  labs(
+    title = "Figura 3. Porcentaje de proteínas sobre el VCT según origen",
+    x = NULL, y = "% VCT"
+  ) +
+  theme_minimal(base_family = "Lato", base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 25, color = "#95a5a6"),
+    axis.title.y = element_text(size = 20),
+    axis.title.x = element_text(size = 20),
+    axis.text = element_text(size = 16),
+    legend.position = "none"
+  )
+```
+
+Se puede interpretar que quienes consumen carnes y derivados ingieren casi el doble de proteína (g) y destinan una fracción de energía notablemente mayor al macronutriente, con variabilidad amplia; los que no consumen carnes se concentran en porcentajes bajos y con poca dispersión.
+
+## Ingesta de hidratos de carbono
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.align='center'}
+carb <- base_completa %>%
+  mutate(
+    # seguridad por si hubiera NA
+    azucares_g = ifelse(is.na(azucares_g), pmax(carb_g - fibra_g, 0), azucares_g),
+    prop_fibra   = ifelse(carb_g > 0, pmin(pmax(fibra_g   / carb_g, 0), 1), NA),
+    prop_no_fib  = ifelse(carb_g > 0, pmin(pmax(azucares_g/ carb_g, 0), 1), NA),
+    azucares_cat = factor(azucares_cat, levels = c("Adecuado","Alto")),
+    fibra_cat    = factor(fibra_cat,    levels = c("Adecuado","Bajo"))
+  )
+
+# =========================
+# 1) Tabla de medidas (g y %VCT)
+# =========================
+tabla_carb <- carb %>%
+  summarise(
+    `Carbohidratos totales (g)` = list(c(
+      Mín   = min(carb_g, na.rm = TRUE),
+      Media = mean(carb_g, na.rm = TRUE),
+      Máx   = max(carb_g, na.rm = TRUE),
+      Desvío= sd(carb_g, na.rm = TRUE)
+    )),
+    `Fibra (g)` = list(c(
+      Mín   = min(fibra_g, na.rm = TRUE),
+      Media = mean(fibra_g, na.rm = TRUE),
+      Máx   = max(fibra_g, na.rm = TRUE),
+      Desvío= sd(fibra_g, na.rm = TRUE)
+    )),
+    `Carbohidratos no fibrosos (≈ azúcares) (g)` = list(c(
+      Mín   = min(azucares_g, na.rm = TRUE),
+      Media = mean(azucares_g, na.rm = TRUE),
+      Máx   = max(azucares_g, na.rm = TRUE),
+      Desvío= sd(azucares_g, na.rm = TRUE)
+    ))
+  ) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "val") %>%
+  unnest_wider(val) %>%
+  mutate(across(-Variable, ~round(.x, 1)))
+
+tabla_carb %>%
+  kable(caption = "Tabla 4. Medidas descriptivas de hidratos de carbono (totales, fibra y azúcares)",
+        align = "lrrrr") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped","hover","condensed"))
+
+# =========================
+# 2) Composición: fibra vs no fibrosos
+#    a) Promedio global 100% apilado
+# =========================
+comp_mean <- carb %>%
+  filter(!is.na(prop_fibra), !is.na(prop_no_fib)) %>%
+  summarise(
+    Fibra = mean(prop_fibra, na.rm = TRUE),
+    `No fibrosos (≈ azúcares)` = mean(prop_no_fib, na.rm = TRUE)
+  ) %>%
+  pivot_longer(everything(), names_to = "Componente", values_to = "porc") %>%
+  mutate(porc = 100*porc)
+
+ggplot(comp_mean, aes(x = "", y = porc, fill = Componente)) +
+  geom_col(width = 0.6, color = "white") +
+  geom_text(aes(label = percent(porc/100, accuracy = 0.1)),
+            position = position_stack(vjust = 0.5), size = 4) +
+  scale_fill_manual(values = c("Fibra" = "#D9B9A0",
+                               "No fibrosos (≈ azúcares)" = "#B9E0D9")) +
+  labs(title = "Figura 4. Composición promedio de los hidratos de carbono",
+       x = NULL, y = "% del total de HC") +
+  theme_minimal(base_family = "Lato", base_size = 16) +
+  theme(legend.title = element_blank(),
+        plot.title = element_text(hjust = 0.5, color = "#95a5a6", size = 25),
+        axis.title.y = element_text(size = 20),
+    axis.title.x = element_text(size = 20),
+    axis.text = element_text(size = 16)
+        )
+
+library(dplyr)
+library(ggplot2)
+
+# Dataset largo: Azúcares y Fibra en una sola tabla
+df_long <- bind_rows(
+  carb %>% transmute(
+    tipo = "Azúcares (% VCT)",
+    categoria = azucares_cat,          # Adecuado / Alto
+    valor = pct_azucares
+  ),
+  carb %>% transmute(
+    tipo = "Fibra (g/1000 kcal)",
+    categoria = fibra_cat,             # Adecuado / Bajo
+    valor = fibra_g_1000kcal
+  )
+) %>%
+  filter(!is.na(categoria), !is.na(valor)) %>%
+  mutate(
+    categoria = factor(as.character(categoria),
+                       levels = c("Adecuado", "Bajo", "Alto"))
+  )
+
+# Líneas de referencia OMS/MSal
+refs <- tibble::tibble(
+  tipo = c("Azúcares (% VCT)", "Fibra (g/1000 kcal)"),
+  yint = c(10, 14)
+)
+
+ggplot(df_long, aes(x = categoria, y = valor, fill = categoria)) +
+  geom_boxplot(width = 0.6, outlier.alpha = 0.35) +
+  facet_wrap(~ tipo, scales = "free_y", nrow = 1) +
+  geom_hline(data = refs, aes(yintercept = yint),
+             linetype = "dashed", color = "#95a5a6") +
+  scale_fill_manual(values = c("Adecuado" = "#7A958F",
+                               "Bajo"     = "#F2D5CD",
+                               "Alto"     = "#F2D5CD")) +
+  labs(title = "Figura 5. HC por tipo: azúcares y fibra vs criterios OMS/MSal",
+       x = NULL, y = NULL) +
+  theme_minimal(base_family = "Lato", base_size = 14) +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5, color = "#95a5a6", size = 25),
+        axis.title.y = element_text(size = 20),
+    axis.title.x = element_text(size = 20),
+    axis.text = element_text(size = 16))
+
+# =========================
+# 6) Relación HC totales vs fibra (g)
+# =========================
+ggplot(carb, aes(x = carb_g, y = fibra_g)) +
+  geom_point(alpha = 0.6, size = 2, color = "#7A958F") +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.7, color = "#7A958F") +
+  labs(title = "Figura 6. Relación entre carbohidratos totales y fibra",
+       x = "Carbohidratos totales (g)", y = "Fibra (g)") +
+  theme_minimal(base_family = "Lato", base_size = 14) +
+  theme(plot.title = element_text(hjust = 0.5, color = "#95a5a6", size = 25),
+        axis.title.y = element_text(size = 20),
+    axis.title.x = element_text(size = 20),
+    axis.text = element_text(size = 16))
+```
+
+La ingesta media de hidratos de carbono fue 162,5 g/día (DE 93,5; 17,2–426,7). La fibra promedió 14,3 g/día (DE 10,1) y los carbohidratos no fibrosos (≈ azúcares) 148,3 g/día (DE 90,8). En términos relativos, la dieta se compuso mayormente de no fibrosos (~89%) y muy poco de fibra (~11%). El % de azúcares sobre el VCT superó con frecuencia el 10% recomendado, mientras que la fibra por 1000 kcal fue mayoritariamente “Bajo” (<14 g/1000 kcal). La asociación entre carbohidratos totales y fibra fue positiva pero débil, por lo que más carbohidratos no implica mayor aporte de fibra.
+
+## Ingesta de grasas
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.align='center'}
+fat <- base_completa %>%
+  mutate(
+    fat_g  = pmax(fat_g, 0),
+    sat_g  = pmax(sat_g, 0),
+    mono_g = pmax(mono_g, 0),
+    poli_g = pmax(poli_g, 0),
+
+    prop_sat  = ifelse(fat_g > 0, pmin(pmax(sat_g  / fat_g, 0), 1), NA),
+    prop_mono = ifelse(fat_g > 0, pmin(pmax(mono_g / fat_g, 0), 1), NA),
+    prop_poli = ifelse(fat_g > 0, pmin(pmax(poli_g / fat_g, 0), 1), NA),
+
+    sat_cat  = factor(sat_cat,  levels = c("Adecuado","Alto")),
+    mono_cat = factor(mono_cat, levels = c("Adecuado","Alto")),
+    poli_cat = factor(poli_cat, levels = c("Bajo","Adecuado","Alto"))
+  )
+
+tabla_fat_g <- fat %>%
+  summarise(
+    across(
+      c(fat_g, sat_g, mono_g, poli_g),
+      list(Mín = ~min(., na.rm = TRUE),
+           Media = ~mean(., na.rm = TRUE),
+           Máx = ~max(., na.rm = TRUE),
+           `Desvío` = ~sd(., na.rm = TRUE)),
+      .names = "{.col}_{.fn}"
+    )
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to   = c("Variable", ".value"),
+    names_pattern = "^(.*)_([^_]*)$"   # <— toma todo hasta el ÚLTIMO "_"
+  ) %>%
+  mutate(
+    Variable = recode(Variable,
+      fat_g  = "Grasa total (g)",
+      sat_g  = "Saturadas (g)",
+      mono_g = "Monoinsaturadas (g)",
+      poli_g = "Poliinsaturadas (g)"
+    ),
+    across(-Variable, ~round(.x, 1))
+  )
+
+tabla_fat_g %>%
+  kable(caption = "Tabla 5. Medidas descriptivas de grasas (g)", align = "lrrrr") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped","hover","condensed"))
+
+comp_fat <- fat %>%
+  filter(!is.na(prop_sat), !is.na(prop_mono), !is.na(prop_poli)) %>%
+  summarise(
+    `Saturadas`       = mean(prop_sat,  na.rm = TRUE),
+    `Monoinsaturadas` = mean(prop_mono, na.rm = TRUE),
+    `Poliinsaturadas` = mean(prop_poli, na.rm = TRUE)
+  ) %>%
+  pivot_longer(everything(), names_to = "Tipo", values_to = "porc") %>%
+  mutate(porc = 100*porc)
+
+ggplot(comp_fat, aes(x = "Composición promedio", y = porc, fill = Tipo)) +
+  geom_col(width = 0.6, color = "white") +
+  geom_text(aes(label = percent(porc/100, accuracy = 0.1)),
+            position = position_stack(vjust = 0.5), size = 4) +
+  scale_fill_manual(values = c("Saturadas"="#F2D5CD","Monoinsaturadas"="#D9B9A0","Poliinsaturadas"="#B9E0D9")) +
+  labs(title = "Figura 7. Composición promedio de la grasa dietaria", x = NULL, y = "% de la grasa total") +
+  theme_minimal(base_family = "Lato", base_size = 14) +
+  theme(legend.title = element_blank(),
+        plot.title = element_text(hjust = 0.5, color = "#95a5a6", size = 25),
+        axis.title.y = element_text(size = 20),
+    axis.title.x = element_text(size = 20),
+    axis.text = element_text(size = 16))
+
+df_long <- bind_rows(
+  fat %>% transmute(tipo = "Saturadas (% VCT)",       categoria = sat_cat,  valor = pct_sat),
+  fat %>% transmute(tipo = "Monoinsaturadas (% VCT)", categoria = mono_cat, valor = pct_mono),
+  fat %>% transmute(tipo = "Poliinsaturadas (% VCT)", categoria = poli_cat, valor = pct_poli)
+) %>%
+  filter(!is.na(categoria), !is.na(valor)) %>%
+  mutate(categoria = factor(as.character(categoria), levels = c("Adecuado","Bajo","Alto")))
+
+refs <- tibble::tibble(
+  tipo = c("Saturadas (% VCT)","Monoinsaturadas (% VCT)","Poliinsaturadas (% VCT)","Poliinsaturadas (% VCT)"),
+  yint = c(10, 20, 6, 11)
+)
+
+ggplot(df_long, aes(x = categoria, y = valor, fill = categoria)) +
+  geom_boxplot(width = 0.6, outlier.alpha = 0.35) +
+  facet_wrap(~ tipo, scales = "free_y", nrow = 1) +
+  geom_hline(data = refs, aes(yintercept = yint), linetype = "dashed", color = "#95a5a6") +
+  scale_fill_manual(values = c("Adecuado"="#7A958F","Bajo"="#F2D5CD","Alto"="#F2D5CD")) +
+  labs(title = "Figura 8. Grasas por tipo: % del VCT y categorías OMS/MSal",
+       x = NULL, y = "% del VCT") +
+  theme_minimal(base_family = "Lato", base_size = 14) +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5, color = "#95a5a6", size = 25),
+        axis.title.y = element_text(size = 20),
+    axis.title.x = element_text(size = 20),
+    axis.text = element_text(size = 16))
+```
+
+La ingesta media de grasa total fue 52,5 g/día (DE 26,4; 5,3–144,1). La composición relativa de la fracción lipídica mostró predominio de monoinsaturadas (~37%), seguida por saturadas (~32%) y poliinsaturadas (~22%). En términos energéticos, se observó una proporción relevante de participantes con saturadas >10% del VCT y con monoinsaturadas >20% del VCT, mientras que las poliinsaturadas fueron con frecuencia bajas (<6% del VCT), con pocos casos por encima del rango adecuado (6–11%). En conjunto, el perfil lipídico combina exceso de saturadas/monoinsaturadas y déficit de poliinsaturadas respecto de los umbrales OMS/MSal, sugiriendo margen de mejora en la calidad de la grasa dietaria (desplazamiento desde saturadas hacia fuentes ricas en AGPI).
+
+# Variables de calidad de sueño
+
+## Cálculo numérico de Pittsburgh
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.align='center'}
+tab_pitts <- base_completa %>%
+  summarise(
+    Media   = mean(Pittsburgh, na.rm = TRUE),
+    Mediana = median(Pittsburgh, na.rm = TRUE),
+    `Desvío`= sd(Pittsburgh, na.rm = TRUE),
+    Mín     = min(Pittsburgh, na.rm = TRUE),
+    Máx     = max(Pittsburgh, na.rm = TRUE)
+  ) %>%
+  mutate(across(where(is.numeric), ~round(.x, 1)))
+
+tab_pitts %>%
+  kable(caption = "Tabla 6. Medidas descriptivas del puntaje Pittsburgh") %>%
+  kable_styling(full_width = FALSE,
+                bootstrap_options = c("striped","hover","condensed"),
+                position = "center")
+
+media_p <- mean(base_completa$Pittsburgh, na.rm = TRUE)
+
+ggplot(base_completa, aes(x = Pittsburgh)) +
+  geom_histogram(binwidth = 1, boundary = 0,
+                 fill = "#CA8E83", color = "white") +
+  labs(title = "Figura 9. Distribución del puntaje Pittsburgh",
+       x = "Pittsburgh", y = "Frecuencia") +
+  theme_minimal(base_family = "Lato", base_size = 14) +
+  theme(plot.title = element_text(hjust = 0.5, color = "#95a5a6", size = 25),
+        axis.title.y = element_text(size = 20),
+    axis.title.x = element_text(size = 20),
+    axis.text = element_text(size = 16))
+```
+
+## Calidad de sueño
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.align='center'}
+tab_calidad <- base_completa %>%
+  mutate(`Calidad de sueño` = factor(
+    calidad_sueno,
+    levels = c("Buena calidad", "Mala calidad")
+  )) %>%
+  count(`Calidad de sueño`, name = "Frecuencia") %>%
+  mutate(Porcentaje = paste0(round(100 * Frecuencia / sum(Frecuencia), 1), "%"))
+
+tab_calidad %>%
+  kable(caption = "Tabla 7. Distribución de la calidad del sueño según Pittsburgh") %>%
+  kable_styling(full_width = FALSE,
+                bootstrap_options = c("striped","hover","condensed"),
+                position = "center")
+
+ggplot(filter(base_completa, !is.na(calidad_sueno)),
+       aes(x = calidad_sueno, y = Pittsburgh, fill = calidad_sueno)) +
+  geom_boxplot(width = 0.6, outlier.alpha = 0.35) +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "#95a5a6") +
+  scale_fill_manual(values = c("Buena calidad" = "#B9E0D9",
+                               "Mala calidad"  = "#F2D5CD")) +
+  labs(title = "Figura 10. Pittsburgh por categoría de calidad del sueño",
+       x = NULL, y = "Pittsburgh", fill = NULL) +
+  theme_minimal(base_family = "Lato", base_size = 14) +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5, color = "#95a5a6", size = 25),
+        axis.title.y = element_text(size = 20),
+    axis.title.x = element_text(size = 20),
+    axis.text = element_text(size = 16))
+```
+
+En esta muestra predominan puntuaciones bajas–moderadas de Pittsburgh, pero un tercio supera el punto de corte, indicando una proporción relevante con mala calidad de sueño y variabilidad marcada dentro de este subgrupo.
